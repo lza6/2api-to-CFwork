@@ -78,6 +78,583 @@ ncaught SyntaxError: Invalid or unexpected token at worker.js:345:20
 
 我下方可以给你几个我的成功品你可以参考参考一下：
 
+
+比较现代化的你看看差不多是这样的啦：
+// =================================================================================
+//  项目: questionai-2api (Cloudflare Worker 单文件版)
+//  版本: 8.1.0 (代号: API Compatibility - 兼容性增强版)
+//  作者: 首席AI执行官
+//  日期: 2025-11-25
+//
+//  [v8.1.0 更新日志]
+//  1. [智能分流] 区分 Web UI 和 API 客户端。
+//  2. [完美兼容] Cherry Studio/NextChat 等客户端不再接收 Debug 日志，解决格式报错。
+//  3. [功能保留] Web UI 依然保留完整的右侧实时调试面板。
+//  4. [核心继承] 继承 v8.0.0 的所有指纹修复和时序同步逻辑。
+// =================================================================================
+
+const CONFIG = {
+  PROJECT_NAME: "questionai-2api-v8.1",
+  PROJECT_VERSION: "8.1.0",
+  API_MASTER_KEY: "1", 
+  BASE_URL: "https://questionai.io",
+  ENDPOINT_HI: "https://questionai.io/user/hi",
+  ENDPOINT_CHAT: "https://questionai.io/workflow/start",
+  USER_AGENT: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
+  MODELS: ["questionai-general", "questionai-math", "questionai-coding", "gpt-4o-mini"],
+  DEFAULT_MODEL: "questionai-general",
+  
+  // 严格匹配抓包数据的 Header
+  BUBBLE_BASE_HEADERS: {
+    "x-bubble-appname": "questionai",
+    "x-bubble-breaking-revision": "5",
+    "x-bubble-client-version": "d0f9bbf36a0d3aa20a11d33c4d933f5824d8abf6",
+    "x-bubble-client-commit-timestamp": "1764023316000",
+    "x-bubble-platform": "web",
+    "x-requested-with": "XMLHttpRequest",
+    "sec-ch-ua": '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin"
+  }
+};
+
+class Logger {
+    constructor() { this.logs = []; }
+    add(step, data) {
+        const time = new Date().toISOString().split('T')[1].slice(0, -1);
+        this.logs.push({ time, step, data });
+    }
+    get() { return this.logs; }
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    const apiKey = env.API_MASTER_KEY || CONFIG.API_MASTER_KEY;
+    const url = new URL(request.url);
+    if (request.method === 'OPTIONS') return handleCorsPreflight();
+    if (url.pathname === '/') return handleUI(request, apiKey);
+    if (url.pathname.startsWith('/v1/')) return handleApi(request, apiKey);
+    return createErrorResponse(`Path not found: ${url.pathname}`, 404);
+  }
+};
+
+async function handleApi(request, apiKey) {
+  const authHeader = request.headers.get('Authorization');
+  if (apiKey && apiKey !== "1") {
+    if (!authHeader || !authHeader.startsWith('Bearer ')) return createErrorResponse('Unauthorized', 401);
+    if (authHeader.substring(7) !== apiKey) return createErrorResponse('Invalid Key', 403);
+  }
+  const url = new URL(request.url);
+  if (url.pathname === '/v1/models') {
+    return new Response(JSON.stringify({
+      object: 'list',
+      data: CONFIG.MODELS.map(id => ({ id, object: 'model', created: Math.floor(Date.now()/1000), owned_by: 'questionai' })),
+    }), { headers: corsHeaders({ 'Content-Type': 'application/json' }) });
+  }
+  if (url.pathname === '/v1/chat/completions') {
+    return handleChatCompletions(request);
+  }
+  return createErrorResponse('Not Found', 404);
+}
+
+// --- ID 生成器 (严格模式) ---
+function generateBubbleId(timestamp) {
+    const ts = timestamp || Date.now();
+    let randomPart = '';
+    for (let i = 0; i < 18; i++) randomPart += Math.floor(Math.random() * 10);
+    return `${ts}x${randomPart}`;
+}
+
+// --- 握手逻辑 ---
+async function obtainFreshSession(logger) {
+    try {
+        logger.add("Handshake", "Requesting /user/hi...");
+        const response = await fetch(CONFIG.ENDPOINT_HI, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "User-Agent": CONFIG.USER_AGENT,
+                "Origin": CONFIG.BASE_URL,
+                "Referer": CONFIG.BASE_URL + "/",
+                ...CONFIG.BUBBLE_BASE_HEADERS
+            },
+            body: "{}"
+        });
+
+        const rawSetCookie = response.headers.get("set-cookie");
+        logger.add("Handshake Response", { status: response.status, set_cookie: rawSetCookie });
+
+        if (!response.ok) throw new Error(`Handshake failed: ${response.status}`);
+
+        const data = await response.json();
+        const userId = data.bubble_session_uid;
+        if (!userId) throw new Error("No bubble_session_uid returned");
+
+        let cookieMap = new Map();
+        if (rawSetCookie) {
+            const cookies = rawSetCookie.split(/,(?=\s*[^;]+=[^;]+)/);
+            cookies.forEach(c => {
+                const part = c.split(';')[0].trim();
+                const [k, v] = part.split('=');
+                if (k && v) cookieMap.set(k, v);
+            });
+        }
+
+        cookieMap.set("questionai_u1main", userId);
+        if (!cookieMap.has("_ga")) cookieMap.set("_ga", `GA1.1.${Date.now()}`);
+        if (!cookieMap.has("__stripe_mid")) cookieMap.set("__stripe_mid", crypto.randomUUID());
+
+        let cookieString = "";
+        for (const [key, value] of cookieMap) {
+            cookieString += `${key}=${value}; `;
+        }
+
+        return { userId, cookieString };
+    } catch (e) {
+        logger.add("Handshake Error", e.message);
+        throw e;
+    }
+}
+
+// --- Payload 构造 ---
+function buildBubblePayload(userPrompt, userId, timestampBase) {
+    const runId = generateBubbleId(timestampBase - 2);
+    const serverCallId = generateBubbleId(timestampBase);
+    const seedInt = Math.floor(Math.random() * 900000000000000000) + 100000000000000000;
+
+    return {
+        "wait_for": [],
+        "app_last_change": "38461217590",
+        "client_breaking_revision": 5,
+        "calls": [{
+            "client_state": {
+                "element_instances": {
+                    "bTTsS": { "dehydrated": "1348695171700984260__LOOKUP__ElementInstance::bTUEj:bTTsS", "parent_element_id": "bTTsN" },
+                    "bTUEj:bTTsS": { "dehydrated": "1348695171700984260__LOOKUP__ElementInstance::bTUEj:bTTsS", "parent_element_id": "bTTsN" },
+                    "bTTsX": { "dehydrated": "1348695171700984260__LOOKUP__ElementInstance::bTUEj:bTTsX", "parent_element_id": "bTTsM" },
+                    "bTUEj:bTTsX": { "dehydrated": "1348695171700984260__LOOKUP__ElementInstance::bTUEj:bTTsX", "parent_element_id": "bTTsM" },
+                    "bTTsf": { "dehydrated": "1348695171700984260__LOOKUP__ElementInstance::bTUEj:bTTsf", "parent_element_id": "bTTse" },
+                    "bTUEj:bTTsf": { "dehydrated": "1348695171700984260__LOOKUP__ElementInstance::bTUEj:bTTsf", "parent_element_id": "bTTse" },
+                    "bTUEj": { "dehydrated": "1348695171700984260__LOOKUP__ElementInstance::bTUEj", "parent_element_id": "bTHxD" },
+                    "bTTrP": { "dehydrated": "1348695171700984260__LOOKUP__ElementInstance::bTUEj", "parent_element_id": "bTHxD" },
+                    "bTUEj:bTTrP": { "dehydrated": "1348695171700984260__LOOKUP__ElementInstance::bTUEj", "parent_element_id": "bTHxD" },
+                    "bTTsN": { "dehydrated": "1348695171700984260__LOOKUP__ElementInstance::bTUEj:bTTsN", "parent_element_id": "bTTsM" },
+                    "bTUEj:bTTsN": { "dehydrated": "1348695171700984260__LOOKUP__ElementInstance::bTUEj:bTTsN", "parent_element_id": "bTTsM" }
+                },
+                "element_state": {
+                    "1348695171700984260__LOOKUP__ElementInstance::bTUEj:bTTsX": {
+                        "is_visible": true,
+                        "value_that_is_valid": userPrompt,
+                        "value": userPrompt
+                    },
+                    "1348695171700984260__LOOKUP__ElementInstance::bTUEj:bTTsf": {
+                        "list_data": {
+                            "_class": "ListWrapper",
+                            "query": {
+                                "t": "Sort",
+                                "sorts_list": [{ "sort_field": "Created Date", "descending": false }],
+                                "prev": {
+                                    "t": "Filter",
+                                    "constraints": [{ 
+                                        "key": "Created By", 
+                                        "value": `1348695171700984260__LOOKUP__${userId}`, 
+                                        "constraint_type": "equals" 
+                                    }],
+                                    "prev": { "t": "All", "type": "custom.chat_ai" }
+                                }
+                            }
+                        }
+                    },
+                    "1348695171700984260__LOOKUP__ElementInstance::bTUEj:bTTsN": { "group_data": null }
+                },
+                "other_data": { "Current Page Scroll Position": 0, "Current Page Width": 948 },
+                "cache": {},
+                "exists": {}
+            },
+            "run_id": runId,
+            "server_call_id": serverCallId,
+            "item_id": "bTTvM",
+            "element_id": "bTTsS",
+            "page_id": "bTGYf",
+            "uid_generator": { 
+                "timestamp": timestampBase, 
+                "seed": seedInt
+            },
+            "random_seed": Math.random(),
+            "current_date_time": timestampBase + 10000,
+            "current_wf_params": {}
+        }],
+        "timezone_offset": -480,
+        "timezone_string": "Asia/Shanghai",
+        "user_id": userId,
+        "should_stream": false,
+        "platform": "web"
+    };
+}
+
+function extractAnswer(data) {
+    try {
+        const callId = Object.keys(data)[0];
+        if (callId && data[callId].step_results) {
+            const results = data[callId].step_results;
+            for (const key in results) {
+                if (results[key].return_value && typeof results[key].return_value === 'object') {
+                    const str = JSON.stringify(results[key].return_value);
+                    if (str.includes("response1_text")) {
+                        const match = str.match(/"response1_text"\s*:\s*"([^"]+)"/);
+                        if (match && match[1]) return match[1].replace(/\\n/g, '\n').replace(/\\"/g, '"');
+                    }
+                }
+            }
+        }
+    } catch (e) {}
+    try {
+        const callId = Object.keys(data)[0];
+        if (callId && data[callId].step_results && data[callId].step_results.bTTvZ) {
+            const choices = data[callId].step_results.bTTvZ.return_value.data._api_c2_choices.query.data;
+            if (Array.isArray(choices) && choices.length > 0) {
+                const content = choices[0].data["_api_c2_message.content"];
+                if (content) return content;
+            }
+        }
+    } catch (e) {}
+    return deepMineAnswer(data);
+}
+
+function deepMineAnswer(data) {
+    let candidates = [];
+    function traverse(obj) {
+        if (!obj) return;
+        if (typeof obj === 'string') {
+            if (/^\d{10,}x\d+$/.test(obj)) return;
+            if (obj === "Unaut" || obj === "horiz" || obj === "ed") return;
+            if (obj.length > 1 && !obj.includes('__LOOKUP__') && !obj.startsWith('http') && !obj.startsWith('data:image') && obj !== "Permission denied" && obj !== "success") {
+                candidates.push(obj);
+            }
+            return;
+        }
+        if (Array.isArray(obj)) { obj.forEach(item => traverse(item)); return; }
+        if (typeof obj === 'object') {
+            for (let key in obj) {
+                if (['dehydrated', 'parent_element_id', 'id', '_id', 'Created By', 'Modified Date', '_api_c2_id', 'run_id'].includes(key)) continue;
+                traverse(obj[key]);
+            }
+        }
+    }
+    traverse(data);
+    candidates.sort((a, b) => {
+        const aScore = (a.match(/[\u4e00-\u9fa5]/g) ? 100 : 0) + a.length;
+        const bScore = (b.match(/[\u4e00-\u9fa5]/g) ? 100 : 0) + b.length;
+        return bScore - aScore;
+    });
+    return candidates.length > 0 ? candidates[0] : null;
+}
+
+async function handleChatCompletions(request) {
+  const logger = new Logger();
+  const requestId = `req-${crypto.randomUUID()}`;
+  
+  try {
+    const body = await request.json();
+    const messages = body.messages || [];
+    
+    // 识别是否为 Web UI 请求
+    const isWebUI = body.is_web_ui === true;
+
+    let fullPrompt = "";
+    messages.forEach(msg => {
+        if (msg.role === 'user') fullPrompt += `User: ${msg.content}\n`;
+        if (msg.role === 'assistant') fullPrompt += `Assistant: ${msg.content}\n`;
+        if (msg.role === 'system') fullPrompt += `System: ${msg.content}\n`;
+    });
+    fullPrompt += "Assistant:"; 
+
+    // 1. 握手
+    const session = await obtainFreshSession(logger);
+    const { userId, cookieString } = session;
+
+    // 2. 准备时间戳
+    const timestampBase = Date.now();
+
+    // 3. 构造 Payload
+    const bubblePayload = buildBubblePayload(fullPrompt, userId, timestampBase);
+    
+    // 4. 构造 Headers
+    const fiberId = generateBubbleId(timestampBase);
+    const plId = `${timestampBase}x${Math.floor(Math.random()*1000)}`;
+
+    const chatHeaders = {
+        "Content-Type": "application/json",
+        "Origin": CONFIG.BASE_URL,
+        "Referer": CONFIG.BASE_URL + "/",
+        "User-Agent": CONFIG.USER_AGENT,
+        "Cookie": cookieString,
+        "x-bubble-fiber-id": fiberId,
+        "x-bubble-pl": plId,
+        ...CONFIG.BUBBLE_BASE_HEADERS
+    };
+
+    logger.add("Chat Request", { headers: chatHeaders, payload: bubblePayload });
+
+    // 5. 发送
+    const response = await fetch(CONFIG.ENDPOINT_CHAT, {
+      method: "POST",
+      headers: chatHeaders,
+      body: JSON.stringify(bubblePayload)
+    });
+
+    if (!response.ok) {
+        const errText = await response.text();
+        logger.add("Upstream Error", { status: response.status, body: errText });
+        throw new Error(`Upstream Error: ${response.status}`);
+    }
+
+    const data = await response.json();
+    logger.add("Raw Response", data);
+
+    // 6. 提取
+    let answer = extractAnswer(data);
+    
+    if (!answer) {
+        const jsonStr = JSON.stringify(data);
+        if (jsonStr.includes("Unauthorized") || jsonStr.includes("Permission denied")) {
+            answer = "❌ Unauthorized (权限拒绝)。请检查日志中的 Seed 格式和 Header。";
+        } else {
+            answer = "⚠️ 无法提取回答。请查看日志中的 Raw Response。";
+        }
+    }
+
+    // 7. 流式输出
+    const { readable, writable } = new TransformStream();
+    const writer = writable.getWriter();
+    const encoder = new TextEncoder();
+
+    (async () => {
+        // [关键修改] 只有 Web UI 才发送 debug 日志，API 客户端不发送
+        if (isWebUI) {
+            await writer.write(encoder.encode(`data: ${JSON.stringify({ debug: logger.get() })}\n\n`));
+        }
+
+        const chunkSize = 5;
+        for (let i = 0; i < answer.length; i += chunkSize) {
+            const chunkContent = answer.slice(i, i + chunkSize);
+            const chunk = {
+                id: requestId,
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                model: body.model || CONFIG.DEFAULT_MODEL,
+                choices: [{ index: 0, delta: { content: chunkContent }, finish_reason: null }]
+            };
+            await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+            await new Promise(r => setTimeout(r, 10)); 
+        }
+        const endChunk = {
+          id: requestId,
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model: body.model || CONFIG.DEFAULT_MODEL,
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+        };
+        await writer.write(encoder.encode(`data: ${JSON.stringify(endChunk)}\n\n`));
+        await writer.write(encoder.encode('data: [DONE]\n\n'));
+        await writer.close();
+      })();
+
+      return new Response(readable, {
+        headers: corsHeaders({ 'Content-Type': 'text/event-stream' })
+      });
+
+  } catch (e) {
+      logger.add("Fatal Error", e.message);
+      // 如果是 API 调用出错，尽量返回标准 JSON 错误
+      return new Response(JSON.stringify({
+          error: { message: e.message, type: "server_error", param: null, code: null }
+      }), { status: 500, headers: corsHeaders({ 'Content-Type': 'application/json' }) });
+  }
+}
+
+function createErrorResponse(message, status) {
+  return new Response(JSON.stringify({ error: { message } }), { status, headers: corsHeaders() });
+}
+function handleCorsPreflight() { return new Response(null, { status: 204, headers: corsHeaders() }); }
+function corsHeaders(headers = {}) {
+  return { ...headers, 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, Authorization' };
+}
+
+// --- Web UI ---
+function handleUI(request, apiKey) {
+  const origin = new URL(request.url).origin;
+  const html = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>${CONFIG.PROJECT_NAME}</title>
+    <style>
+      :root { --bg: #0f172a; --panel: #1e293b; --text: #f1f5f9; --primary: #3b82f6; --accent: #10b981; --err: #ef4444; --code-bg: #020617; }
+      body { font-family: 'Segoe UI', monospace; background: var(--bg); color: var(--text); margin: 0; height: 100vh; display: flex; overflow: hidden; }
+      .container { display: flex; width: 100%; height: 100%; }
+      .left-panel { width: 40%; padding: 20px; display: flex; flex-direction: column; border-right: 1px solid #334155; overflow-y: auto; }
+      .right-panel { width: 60%; padding: 20px; display: flex; flex-direction: column; background: var(--code-bg); }
+      .box { background: var(--panel); padding: 15px; border-radius: 8px; margin-bottom: 15px; border: 1px solid #334155; }
+      .label { font-size: 12px; color: #94a3b8; margin-bottom: 5px; display: block; font-weight: bold; }
+      input, textarea, select { width: 100%; background: var(--bg); border: 1px solid #475569; color: #fff; padding: 10px; border-radius: 6px; box-sizing: border-box; margin-bottom: 10px; font-family: monospace; }
+      button { width: 100%; padding: 12px; background: var(--primary); border: none; border-radius: 6px; color: white; font-weight: bold; cursor: pointer; transition: 0.2s; }
+      button:hover { opacity: 0.9; }
+      button:disabled { background: #475569; cursor: not-allowed; }
+      .chat-window { flex: 1; background: var(--bg); border: 1px solid #334155; border-radius: 8px; padding: 15px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; margin-bottom: 15px; }
+      .msg { padding: 10px 14px; border-radius: 8px; line-height: 1.5; font-size: 14px; max-width: 90%; }
+      .msg.user { align-self: flex-end; background: var(--primary); color: white; }
+      .msg.ai { align-self: flex-start; background: var(--panel); border: 1px solid #334155; }
+      .log-window { flex: 1; overflow-y: auto; font-family: 'Consolas', monospace; font-size: 12px; color: #a5b4fc; white-space: pre-wrap; word-break: break-all; }
+      .log-entry { margin-bottom: 10px; border-bottom: 1px solid #1e293b; padding-bottom: 10px; }
+      .log-key { color: var(--accent); font-weight: bold; }
+      .copy-btn { float: right; background: transparent; border: 1px solid #334155; padding: 4px 8px; font-size: 10px; color: #94a3b8; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="left-panel">
+            <h3>🛸 ${CONFIG.PROJECT_NAME}</h3>
+            <div class="box">
+                <span class="label">API Endpoint</span>
+                <input type="text" value="${origin}/v1/chat/completions" readonly onclick="this.select()">
+                <span class="label">API Key</span>
+                <input type="text" value="${apiKey}" readonly onclick="this.select()">
+            </div>
+            <div class="box">
+                <span class="label">模型选择</span>
+                <select id="model">
+                    ${CONFIG.MODELS.map(m => `<option value="${m}">${m}</option>`).join('')}
+                </select>
+            </div>
+            <div class="chat-window" id="chat">
+                <div style="text-align:center; color:#64748b; margin-top:20px;">对话区域</div>
+            </div>
+            <div class="box" style="margin-bottom:0">
+                <textarea id="prompt" rows="3" placeholder="输入问题...">你好</textarea>
+                <button id="btn" onclick="send()">发送提问</button>
+            </div>
+        </div>
+        <div class="right-panel">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                <span class="label" style="font-size:14px; color:#fff;">📡 实时调试日志</span>
+                <button class="copy-btn" onclick="copyLogs()">复制全部日志</button>
+            </div>
+            <div class="log-window" id="logs">
+                <div style="color:#64748b;">等待请求...<br>日志将显示：握手Cookie、Payload结构、服务器原始响应。</div>
+            </div>
+        </div>
+    </div>
+    <script>
+        const API_KEY = "${apiKey}";
+        const URL = "${origin}/v1/chat/completions";
+        let history = [];
+        let allLogs = [];
+
+        function appendLog(step, data) {
+            const div = document.createElement('div');
+            div.className = 'log-entry';
+            const time = new Date().toLocaleTimeString();
+            const content = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
+            div.innerHTML = \`<div><span style="color:#64748b">[\${time}]</span> <span class="log-key">\${step}</span></div><div>\${content}</div>\`;
+            document.getElementById('logs').appendChild(div);
+            document.getElementById('logs').scrollTop = document.getElementById('logs').scrollHeight;
+            allLogs.push({time, step, data});
+        }
+
+        function copyLogs() {
+            navigator.clipboard.writeText(JSON.stringify(allLogs, null, 2));
+            alert('日志已复制到剪贴板');
+        }
+
+        function appendChat(role, text) {
+            const div = document.createElement('div');
+            div.className = 'msg ' + role;
+            div.innerText = text;
+            document.getElementById('chat').appendChild(div);
+            document.getElementById('chat').scrollTop = document.getElementById('chat').scrollHeight;
+            return div;
+        }
+
+        async function send() {
+            const input = document.getElementById('prompt');
+            const model = document.getElementById('model').value;
+            const val = input.value.trim();
+            if (!val) return;
+            
+            const btn = document.getElementById('btn');
+            btn.disabled = true;
+            btn.innerText = "请求中...";
+            
+            document.getElementById('logs').innerHTML = ''; 
+            allLogs = [];
+            
+            appendChat('user', val);
+            history.push({role: 'user', content: val});
+            input.value = '';
+            
+            const aiMsg = appendChat('ai', '...');
+            let fullText = '';
+
+            try {
+                const res = await fetch(URL, {
+                    method: 'POST',
+                    headers: { 'Authorization': 'Bearer ' + API_KEY, 'Content-Type': 'application/json' },
+                    // [关键修改] Web UI 请求时带上 is_web_ui: true 标记
+                    body: JSON.stringify({ model: model, messages: history, stream: true, is_web_ui: true })
+                });
+
+                const reader = res.body.getReader();
+                const decoder = new TextDecoder();
+                aiMsg.innerText = '';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    const chunk = decoder.decode(value);
+                    const lines = chunk.split('\\n');
+                    
+                    for (const line of lines) {
+                        if (line.startsWith('data: ')) {
+                            const jsonStr = line.slice(6);
+                            if (jsonStr === '[DONE]') break;
+                            try {
+                                const json = JSON.parse(jsonStr);
+                                // Web UI 专门处理 debug 字段
+                                if (json.debug) {
+                                    json.debug.forEach(log => appendLog(log.step, log.data));
+                                    continue;
+                                }
+                                const content = json.choices[0].delta.content;
+                                if (content) {
+                                    fullText += content;
+                                    aiMsg.innerText = fullText;
+                                }
+                            } catch (e) {}
+                        }
+                    }
+                }
+                history.push({role: 'assistant', content: fullText});
+            } catch (e) {
+                aiMsg.innerText = 'Error: ' + e.message;
+                appendLog("Client Error", e.message);
+            } finally {
+                btn.disabled = false;
+                btn.innerText = "发送提问";
+            }
+        }
+    </script>
+</body>
+</html>`;
+  return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+}
+
+
+你要保证有日志等等调试日志等等面板，这样更容易在后期排查出问题等等的
 // =================================================================================
 //  项目: midgenai-2api (Cloudflare Worker 单文件版)
 //  版本: 1.0.0 (代号: Chimera Synthesis - Midgen)
